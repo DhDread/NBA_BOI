@@ -4,7 +4,7 @@ from nba_api.stats.endpoints import ScoreboardV3
 import time
 import numpy as np
 
-DAYS_BACK = 14
+DAYS_BACK = 56
 PAUSE_BETWEEN_REQUESTS = 2.5
 
 
@@ -213,8 +213,71 @@ def compute_q1_win_rate(df):
     q1_win_rate.rename(columns={"win": "Q1_win_rate"}, inplace=True)
 
     return q1_win_rate
+    
+def compute_h2h_win_rate(df):
 
-def build_predictions(df, team_stats):
+    records = []
+
+    for _, row in df.iterrows():
+
+        team_a = row["team_a"]
+        team_b = row["team_b"]
+        winner = row["winner"]
+
+        # team A record
+        records.append({
+            "team": team_a,
+            "opponent": team_b,
+            "win": 1 if winner == team_a else 0,
+            "game": 1
+        })
+
+        # team B record
+        records.append({
+            "team": team_b,
+            "opponent": team_a,
+            "win": 1 if winner == team_b else 0,
+            "game": 1
+        })
+
+    h2h_df = pd.DataFrame(records)
+
+    # aggregate
+    h2h_stats = (
+        h2h_df
+        .groupby(["team", "opponent"])
+        .agg(
+            wins=("win", "sum"),
+            games=("game", "sum")
+        )
+        .reset_index()
+    )
+
+    # win rate
+    h2h_stats["h2h_win_rate"] = h2h_stats["wins"] / h2h_stats["games"]
+
+    # 🔥 formatted column (what you want)
+    h2h_stats["h2h_record"] = (
+        h2h_stats["wins"].astype(int).astype(str)
+        + "/"
+        + h2h_stats["games"].astype(int).astype(str)
+    )
+
+    return h2h_stats
+    
+def get_h2h_rate(h2h_df, team, opponent):
+
+    row = h2h_df[
+        (h2h_df["team"] == team) &
+        (h2h_df["opponent"] == opponent)
+    ]
+
+    if not row.empty:
+        return row.iloc[0]["h2h_win_rate"]
+    
+    return 0.5  # default if no history
+
+def build_predictions(df, team_stats, h2h_df):
     predictions = []
 
     for _, row in df.iterrows():
@@ -227,6 +290,15 @@ def build_predictions(df, team_stats):
 
         stats_a = team_stats[team_stats["team"] == team_a].iloc[0]
         stats_b = team_stats[team_stats["team"] == team_b].iloc[0]
+        
+        h2h_a = get_h2h_rate(h2h_df, team_a, team_b)
+        h2h_row = h2h_df[
+            (h2h_df["team"] == team_a) &
+            (h2h_df["opponent"] == team_b)
+        ]
+
+        h2h_record = h2h_row.iloc[0]["h2h_record"] if not h2h_row.empty else "0/0"
+        h2h_b = 1 - h2h_a
 
         # function to predict points per quarter
         def predict_q(team_stats, opp_stats, q):
@@ -247,18 +319,32 @@ def build_predictions(df, team_stats):
         pred_a = a_q1 + a_q2 + a_q3 + a_q4
         pred_b = b_q1 + b_q2 + b_q3 + b_q4
 
-        # predicted winner
         predicted_winner = team_a if pred_a > pred_b else team_b
 
-        # winner match check
+        # --- 🔥 WIN PROBABILITY ---
+        margin = pred_a - pred_b
+        base_prob_a = 1 / (1 + np.exp(-margin / 10))
+
+        # blend model + head-to-head
+        prob_a = (base_prob_a * 0.7) + (h2h_a * 0.3)
+        prob_b = 1 - prob_a
+
+        # --- 🔥 CONFIDENCE ---
+        max_prob = max(prob_a, prob_b)
+        if max_prob >= 0.7:
+            confidence = "High"
+        elif max_prob >= 0.6:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+
+        # --- RESULT CHECKS ---
         winner_match = "Yes" if predicted_winner == row["winner"] else "No"
 
-        # score differences
         diff_a = abs(pred_a - row["team_a_score"])
         diff_b = abs(pred_b - row["team_b_score"])
         avg_diff = (diff_a + diff_b) / 2
 
-        # score match label
         if avg_diff <= 5:
             score_match = "Excellent"
         elif avg_diff <= 10:
@@ -284,24 +370,30 @@ def build_predictions(df, team_stats):
             "team_b_Q3_pred": round(b_q3),
             "team_b_Q4_pred": round(b_q4),
 
-            # total predicted scores
+            # totals
             "pred_team_a_score": round(pred_a),
             "pred_team_b_score": round(pred_b),
 
-            # actual results
+            # actual
             "actual_team_a_score": row["team_a_score"],
             "actual_team_b_score": row["team_b_score"],
             "actual_winner": row["winner"],
 
-            # predicted winner
+            # predictions
             "predicted_winner": predicted_winner,
+
+            # 🔥 NEW PROBABILITY FIELDS
+            "team_a_win_prob": round(prob_a * 100, 1),
+            "team_b_win_prob": round(prob_b * 100, 1),
+            "confidence": confidence,
 
             # 🔥 comparison metrics
             "Winning_Team_Match": winner_match,
             "Score_Match": score_match,
             "Score_Diff_A": round(diff_a, 1),
             "Score_Diff_B": round(diff_b, 1),
-            "Avg_Score_Diff": round(avg_diff, 1)
+            "Avg_Score_Diff": round(avg_diff, 1),
+            "h2h_record": h2h_record
         })
 
     return pd.DataFrame(predictions)
@@ -335,7 +427,7 @@ def fetch_today_games():
         print(f"Error fetching today's games: {e}")
         return pd.DataFrame()
 
-def predict_today(today_df, team_stats):
+def predict_today(today_df, team_stats, h2h_df):
 
     preds = []
 
@@ -344,9 +436,22 @@ def predict_today(today_df, team_stats):
         team_a = row["team_a"]
         team_b = row["team_b"]
 
+        # skip if missing stats (safety)
+        if team_a not in team_stats["team"].values or team_b not in team_stats["team"].values:
+            continue
+
         stats_a = team_stats[team_stats["team"] == team_a].iloc[0]
         stats_b = team_stats[team_stats["team"] == team_b].iloc[0]
+        
+        h2h_a = get_h2h_rate(h2h_df, team_a, team_b)
+        h2h_row = h2h_df[
+            (h2h_df["team"] == team_a) &
+            (h2h_df["opponent"] == team_b)
+        ]
 
+        h2h_record = h2h_row.iloc[0]["h2h_record"] if not h2h_row.empty else "0/0"
+        h2h_b = 1 - h2h_a
+        
         # --- QUARTER PREDICTIONS ---
         def predict_q(team_stats, opp_stats, q):
             return (
@@ -364,9 +469,30 @@ def predict_today(today_df, team_stats):
         b_q3 = predict_q(stats_b, stats_a, "Q3")
         b_q4 = predict_q(stats_b, stats_a, "Q4")
 
-        # final = sum of quarters (more realistic than separate calc)
+        # --- FINAL SCORE ---
         pred_a = a_q1 + a_q2 + a_q3 + a_q4
         pred_b = b_q1 + b_q2 + b_q3 + b_q4
+
+        predicted_winner = team_a if pred_a > pred_b else team_b
+
+        # --- 🔥 WIN PROBABILITY ---
+        margin = pred_a - pred_b
+
+        base_prob_a = 1 / (1 + np.exp(-margin / 10))
+
+        # blend model + head-to-head
+        prob_a = (base_prob_a * 0.7) + (h2h_a * 0.3)
+        prob_b = 1 - prob_a
+
+        # --- 🔥 CONFIDENCE LEVEL ---
+        max_prob = max(prob_a, prob_b)
+
+        if max_prob >= 0.7:
+            confidence = "High"
+        elif max_prob >= 0.6:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
 
         preds.append({
             "game_date": row["game_date"],
@@ -388,10 +514,16 @@ def predict_today(today_df, team_stats):
             "pred_team_a_score": round(pred_a),
             "pred_team_b_score": round(pred_b),
 
-            "predicted_winner": team_a if pred_a > pred_b else team_b
+            "predicted_winner": predicted_winner,
+
+            # 🔥 NEW FIELDS
+            "team_a_win_prob": round(prob_a * 100, 1),
+            "team_b_win_prob": round(prob_b * 100, 1),
+            "confidence": confidence,
+            "h2h_record": h2h_record
         })
 
-    return pd.DataFrame(preds)
+    return pd.DataFrame(preds) 
     
 def main():
 
@@ -433,7 +565,11 @@ def main():
     team_stats = team_stats.merge(q1_rates, on="team")
 
     # build predictions
-    predictions = build_predictions(df, team_stats)
+    # 🔥 Step 5 - compute H2H FIRST
+    h2h_df = compute_h2h_win_rate(df)
+
+    # 🔥 Step 6 - pass it into predictions
+    predictions = build_predictions(df, team_stats, h2h_df)
     
     # After predictions = build_predictions(df, team_stats)
 
@@ -458,30 +594,64 @@ def main():
 
     
     today_games = fetch_today_games()
-    today_predictions = predict_today(today_games, team_stats)
+    today_predictions = predict_today(today_games, team_stats, h2h_df)
 
     print("\nGames Sample:")
     print(df.head())
     print("\nTeam analysis sample:")
     print(team_stats.head())
 
-    filename = f"NBA_last_{DAYS_BACK}_days.csv"
+#-- EXCEL Version
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"NBA_last_{DAYS_BACK}_days_{timestamp}.xlsx"
 
-    with open(filename, "w", newline="") as f:
-
-        df.to_csv(f, index=False)
-
-        f.write("\n\n\n===== TEAM ANALYSIS =====\n")
-        team_stats.to_csv(f, index=False)
-
-        f.write("\n\n\n===== HISTORICAL PREDICTIONS =====\n")
-        predictions.to_csv(f, index=False)
+    with pd.ExcelWriter(filename, engine="xlsxwriter") as writer:
         
-        f.write("\n\n===== HISTORICAL PREDICTIONS SUMMARY =====\n")
-        pd.DataFrame([summary_stats]).to_csv(f, index=False)
+        # Sheet 1 - Today's Predictions
+        today_predictions.to_excel(writer, sheet_name="Today's Predictions", index=False)
+        
+        # Sheet 2 - Historical Predictions
+        predictions.to_excel(writer, sheet_name="Historical Predictions", index=False)
+        
+        # Sheet 3 - Team Analysis
+        team_stats.to_excel(writer, sheet_name="Team Analysis", index=False)
+        
+        # Sheet 4 - Raw Games
+        df.to_excel(writer, sheet_name="Games", index=False)
 
-        f.write("\n\n\n===== TODAY'S PREDICTIONS =====\n")
-        today_predictions.to_csv(f, index=False)
+        # Optional Sheet 5 - Summary Stats
+        summary_df = pd.DataFrame([summary_stats])
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        
+        # Sheet 6 - Head-to-Head Stats
+        h2h_matrix = h2h_df.pivot(
+            index="team",
+            columns="opponent",
+            values="h2h_record"
+        )
+        h2h_pivot = h2h_df.pivot(index="team", columns="opponent", values="h2h_win_rate")
+        h2h_df.to_excel(writer, sheet_name="H2H Stats", index=False)
+        h2h_matrix.to_excel(writer, sheet_name="H2H Matrix")
+
+# -- CSV Method
+#    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+#    filename = f"NBA_last_{DAYS_BACK}_days_{timestamp}.csv"
+#
+#    with open(filename, "w", newline="") as f:
+#
+#        df.to_csv(f, index=False)
+#
+#        f.write("\n\n\n===== TEAM ANALYSIS =====\n")
+#        team_stats.to_csv(f, index=False)
+#
+#        f.write("\n\n\n===== HISTORICAL PREDICTIONS =====\n")
+#        predictions.to_csv(f, index=False)
+#        
+#        f.write("\n\n===== HISTORICAL PREDICTIONS SUMMARY =====\n")
+#        pd.DataFrame([summary_stats]).to_csv(f, index=False)
+#
+#        f.write("\n\n\n===== TODAY'S PREDICTIONS =====\n")
+#        today_predictions.to_csv(f, index=False)
 
     print(f"\nSaved combined data to {filename}")
 
